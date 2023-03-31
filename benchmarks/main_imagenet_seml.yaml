@@ -1,0 +1,128 @@
+seml:
+  executable: main_imagenet_seml.py
+  name: imagenet_pruning
+  output_dir: logs/
+  project_root_dir: .
+  conda_environment: structure_pruning
+
+slurm:
+  experiments_per_job: 1
+  sbatch_options:
+    gres: gpu:1       # num GPUs
+    mem: 32G          # memory
+#    exclude: gpu[15-19]
+    cpus-per-task: 1  # num cores
+    time: 0-360:00     # max time, D-HH:MM
+    partition: ['gpu_large']
+    qos: phd
+#    qos: interactive
+
+###### BEGIN PARAMETER CONFIGURATION ######
+
+fixed:
+  arguments:
+    data_path: "/nfs/shared/imagenet2012/"
+#    model: "resnet50"
+    pretrained: True
+    device: "cuda"
+    batch_size: 64
+    epochs: 90
+    workers: 16
+    opt: "sgd"
+    lr: 0.01
+    momentum: 0.9
+    weight_decay: 1e-4
+    norm_weight_decay: None
+    bias_weight_decay: None
+    transformer_embedding_decay: None
+    label_smoothing: 0.0
+    mixup_alpha: 0.0
+    cutmix_alpha: 0.0
+    lr_scheduler: "steplr"
+    lr_warmup_epochs: 0
+    lr_warmup_method: "constant"
+    lr_warmup_decay: 0.01
+    lr_step_size: 30
+    lr_gamma: 0.1
+    lr_min: 0.0
+    print_freq: 100
+    output_dir: "."
+    resume: ""
+    start_epoch: 0
+    cache_dataset: False
+    sync_bn: False
+    test_only: False
+    auto_augment: None
+    ra_magnitude: 9
+    augmix_severity: 3
+    random_erase: 0.0
+    amp: False
+    world_size: 1
+    dist_url: "env://"
+    model_ema: False
+    model_ema_steps: 32
+    model_ema_decay: 0.99998
+    use_deterministic_algorithms: False
+    interpolation: "bilinear"
+    val_resize_size: 256
+    val_crop_size: 224
+    train_crop_size: 224
+    clip_grad_norm: None
+    ra_sampler: False
+    ra_reps: 3
+    weights: None
+    prune: True
+#    method: "l1"
+    global_pruning: True
+#    target_flops: 2.0
+    soft_keeping_ratio: 0.0
+    reg: 1e-4
+    max_ch_sparsity: 1.0
+    sl_epochs: None
+    sl_resume: None
+    sl_lr: None
+    sl_lr_step_size: None
+    sl_lr_warmup_epochs: None
+
+grid:
+  arguments:
+    model:
+      type: choice
+      options:
+        - resnet50
+        - densenet121
+        - mobilenet_v2
+        - mobilenet_v2_w_1_4
+        - googlenet
+        - squeezenet1_1
+        - vgg19_bn
+        - mnasnet1_0
+        - resnext50_32x4d
+        - regnet_x_1_6gf
+        - vit_b_16
+
+    method:
+      type: choice
+      options:
+        - l1
+        - snip
+        - crop
+        - synflow
+        - random
+        - lamp
+        - slim
+        - groupnorm
+        - group_sl
+
+    target_flops:
+      type: choice
+      options:
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10

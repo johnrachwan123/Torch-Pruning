@@ -15,7 +15,7 @@ class MetaPruner:
             model (nn.Module): A to-be-pruned model
             example_inputs (torch.Tensor or List): dummy inputs for graph tracing.
             importance (Callable): importance estimator.
-            global_pruning (bool): enable global pruning. 
+            global_pruning (bool): enable global pruning.
             ch_sparsity (float): global channel sparisty.
             ch_sparsity_dict (Dict[nn.Module, float]): layer-specific sparsity.
             iterative_steps (int): number of steps for iterative pruning.
@@ -31,43 +31,67 @@ class MetaPruner:
         """
 
     def __init__(
-        self,
-        # Basic
-        model: nn.Module,
-        example_inputs: torch.Tensor,
-        importance: typing.Callable,
-        # https://pytorch.org/tutorials/intermediate/pruning_tutorial.html#global-pruning.
-        global_pruning: bool = False,
-        ch_sparsity: float = 0.5,  # channel/dim sparsity
-        ch_sparsity_dict: typing.Dict[nn.Module, float] = None,
-        max_ch_sparsity: float = 1.0,
-        iterative_steps: int = 1,  # for iterative pruning
-        iterative_sparsity_scheduler: typing.Callable = linear_scheduler,
-        ignored_layers: typing.List[nn.Module] = None,
+            self,
+            # Basic
+            model: nn.Module,
+            example_inputs: torch.Tensor,
+            importance: typing.Callable,
+            global_pruning: bool = False,
+            semi_global_pruning: bool = False,
+            ch_sparsity: float = 0.5,  # channel/dim sparsity
+            ch_sparsity_dict: typing.Dict[nn.Module, float] = None,
+            ch_group_sparsity_dict: typing.Dict[nn.Module, float] = None,
+            max_ch_sparsity: float = 1.0,
+            iterative_steps: int = 1,  # for iterative pruning
+            iterative_sparsity_scheduler: typing.Callable = linear_scheduler,
+            ignored_layers: typing.List[nn.Module] = None,
+            module_list=None,
 
-        # Advanced
-        round_to: int = None,  # round channels to 8x, 16x, ...
-        # for grouped channels.
-        channel_groups: typing.Dict[nn.Module, int] = dict(),
-        # pruners for customized layers
-        customized_pruners: typing.Dict[typing.Any,
-                                        function.BasePruningFunc] = None,
-        # unwrapped nn.Parameters like ViT.pos_emb
-        unwrapped_parameters: typing.List[nn.Parameter] = None,
-        root_module_types: typing.List = [
-            ops.TORCH_CONV, ops.TORCH_LINEAR, ops.TORCH_LSTM],  # root module for each group
-        output_transform: typing.Callable = None,
+            # Advanced
+            round_to: int = None,  # round channels to 8x, 16x, ...
+            channel_groups: typing.Dict[nn.Module, int] = dict(),  # for grouped channels.
+            customized_pruners: typing.Dict[typing.Any, function.BasePruningFunc] = None,
+            # pruners for customized layers
+            unwrapped_parameters: typing.List[nn.Parameter] = None,  # unwrapped nn.Parameters like ViT.pos_emb
+            root_module_types: typing.List = [ops.TORCH_CONV, ops.TORCH_LINEAR, ops.TORCH_LSTM],
+            # root module for each group
+            output_transform: typing.Callable = None,
+
+            # Gradient-based
+            crit=None,
+            Loss=None,
+            dataloader=None,
+            backward_needed=True,
+            pruning_batch_size=64,
+            iterations=1,
+
+            # Yolo
+            yolo=False,
+            scaler=None
+
     ):
         self.model = model
         self.importance = importance
         self.ch_sparsity = ch_sparsity
         self.ch_sparsity_dict = ch_sparsity_dict if ch_sparsity_dict is not None else {}
+        self.ch_group_sparsity_dict = ch_group_sparsity_dict if ch_group_sparsity_dict is not None else {}
         self.max_ch_sparsity = max_ch_sparsity
         self.global_pruning = global_pruning
+        self.semi_global_pruning = semi_global_pruning
 
         self.channel_groups = channel_groups
         self.root_module_types = root_module_types
         self.round_to = round_to
+
+        self.crit = crit
+        self.Loss = Loss
+        self.pruning_batch_size = pruning_batch_size
+        self.backward_needed = backward_needed
+        self.yolo = yolo
+        self.scaler = scaler
+        self.dataloader = dataloader
+        self.module_list = module_list
+        self.iterations = iterations
 
         # Build dependency graph
         self.DG = dependency.DependencyGraph().build_dependency(
@@ -129,6 +153,8 @@ class MetaPruner:
                     group[0][0].target.module) // ch_groups)
             self.initial_total_channels = initial_total_channels
 
+    def pre_prune(self, pruning_batch_size=64, iterations=1, yolo=False):
+        pass
     def get_target_sparsity(self, module):
         s = self.ch_sparsity_dict.get(module, self.per_step_ch_sparsity)[
             self.current_step]
@@ -145,7 +171,11 @@ class MetaPruner:
     def step(self, interactive=False):
         self.current_step += 1
         if self.global_pruning:
-            if interactive:
+            if self.backward_needed == True:
+                self.pre_prune(pruning_batch_size=self.pruning_batch_size, iterations=self.iterations, yolo=self.yolo)
+            if self.semi_global_pruning:
+                self.semi_prune_global()
+            elif interactive:
                 return self.prune_global()
             else:
                 for group in self.prune_global():
@@ -191,6 +221,59 @@ class MetaPruner:
                 return self.channel_groups[module]
         return 1  # no channel grouping
 
+    def prune_local_index(self, index, nb_parameters=10):
+        if self.current_step >= self.iterative_steps:
+            return
+
+        layers = [str(i) for i in range(25)]
+        layers.reverse()
+
+        for idx, group in enumerate(self.get_all_groups()):
+            # check pruning rate
+            if idx == index:
+                deps = "".join([str(dep) for dep, _ in group])
+                import re
+
+                id = re.findall(r"model\.(\d+)", str(deps))
+                id = list(set(id))
+
+                if self._check_sparsity(group):
+                    module = group[0][0].target.module
+                    pruning_fn = group[0][0].handler
+
+                    ch_groups = self.get_channel_groups(group)
+                    if self.backward_needed == True:
+                        # Suboptimal since it recalculates scores for every layer
+                        self.pre_prune(pruning_batch_size=self.pruning_batch_size, iterations=self.iterations,
+                                       yolo=self.yolo)
+                    imp = self.estimate_importance(group, ch_groups=ch_groups)
+                    current_channels = self.DG.get_out_channels(module)
+                    target_sparsity = self.get_target_sparsity(module)
+                    n_pruned = current_channels - int(
+                        self.layer_init_out_ch[module] *
+                        (1 - target_sparsity)
+                    )
+                    n_pruned = nb_parameters
+
+                    if self.round_to:
+                        n_pruned = n_pruned - (n_pruned % self.round_to)
+
+                    if n_pruned <= 0:
+                        continue
+                    if ch_groups > 1:
+                        imp = imp[:len(imp) // ch_groups]
+                    imp_argsort = torch.argsort(imp)
+                    pruning_idxs = imp_argsort[:(n_pruned // ch_groups)]
+                    if ch_groups > 1:
+                        group_size = current_channels // ch_groups
+                        pruning_idxs = torch.cat([pruning_idxs + group_size * i for i in range(ch_groups)], 0)
+                    group = self.DG.get_pruning_group(
+                        module, pruning_fn, pruning_idxs.tolist())
+                    if self.DG.check_pruning_group(group):
+                        group.exec()
+                    break
+        return id
+
     def prune_local(self):
         if self.current_step > self.iterative_steps:
             return
@@ -201,6 +284,10 @@ class MetaPruner:
                 pruning_fn = group[0][0].handler
 
                 ch_groups = self.get_channel_groups(group)
+                if self.backward_needed == True:
+                    # Suboptimal since it recalculates scores for every layer
+                    self.pre_prune(pruning_batch_size=self.pruning_batch_size, iterations=self.iterations,
+                                   yolo=self.yolo)
                 imp = self.estimate_importance(group, ch_groups=ch_groups)
                 current_channels = self.DG.get_out_channels(module)
                 target_sparsity = self.get_target_sparsity(module)
@@ -268,3 +355,125 @@ class MetaPruner:
                 module, pruning_fn, pruning_indices.tolist())
             if self.DG.check_pruning_group(group):
                 yield group
+
+    def semi_prune_global(self, num_splits=5, local=False):
+        # print([m for m in self.DG.module2node.keys() if isinstance(m, tuple(self.root_module_types))])
+        # print(len([m for m in self.DG.module2node.keys() if isinstance(m, tuple(self.root_module_types))]))
+        # breakpoint()
+        if self.current_step >= self.iterative_steps:
+            return
+
+        global_importance = []
+        for group in self.get_all_groups():
+            if self._check_sparsity(group):
+                ch_groups = self.get_channel_groups(group)
+                imp = self.estimate_importance(group, ch_groups=ch_groups)
+                if ch_groups > 1:
+                    imp = imp[:len(imp) // ch_groups]
+                global_importance.append((group, ch_groups, imp))
+
+        def split_list(lst, chunk_size):
+            for i in range(0, len(lst), chunk_size):
+                yield lst[i:i + chunk_size]
+
+        def split_list_specific(lst, chunk_list):
+            j = 0
+            for i in range(len(chunk_list)):
+                yield lst[j:i + 1]
+                j += i + 1
+
+        def split_list_new(lst):
+            backbone = []
+            neck = []
+            head = []
+            indices = []
+            backbone_indices = []
+            neck_indices = []
+            head_indices = []
+
+            for idx, (group, ch_groups, imp) in enumerate(global_importance):
+                deps = "".join([str(dep) for dep, _ in group])
+                if 'model.24' in deps:
+                    head.append((group, ch_groups, imp))
+                    head_indices.append(idx)
+                elif 'model.10' in deps or 'model.11' in deps or 'model.12' in deps or 'model.13' in deps or 'model.14' in deps or 'model.15' in deps or 'model.16' in deps or 'model.17' in deps or 'model.18' in deps or 'model.19' in deps or 'model.20' in deps or 'model.21' in deps or 'model.22' in deps or 'model.23' in deps:
+                    neck.append((group, ch_groups, imp))
+                    neck_indices.append(idx)
+                else:
+                    backbone.append((group, ch_groups, imp))
+                    backbone_indices.append(idx)
+
+                # for dep, _ in group:
+                #     if '24' in str(dep):
+                #         indices.append(idx)
+                #         head.append((group, ch_groups, imp))
+                #         break
+            return backbone, neck, head, backbone_indices, neck_indices, head_indices
+
+        imp_list = []
+        if not local:
+            len_splits = int(len(global_importance) / num_splits)
+        else:
+            len_splits = 1
+        print(len_splits)
+        # splits = list(split_list_specific(global_importance, [46,3]))
+        splits = []
+        backbone, neck, head, backbone_indices, neck_indices, head_indices = split_list_new(global_importance)
+        splits.append(backbone)
+        splits.append(neck)
+        splits.append(head)
+        print(len(splits))
+        print("lol")
+        print(len(splits[0]))
+        print(len(splits[1]))
+        print(len(splits[2]))
+        # breakpoint()
+        for split in splits:
+            imp_list.append(torch.cat([local_imp[-1] for local_imp in split], dim=0))
+
+        target_sparsity = self.per_step_ch_sparsity[self.current_step]
+        n_pruned_list = []
+        for im in imp_list:
+            n_pruned = len(im) - int(
+                len(im) *
+                (1 - target_sparsity)
+            )
+            if n_pruned <= 0:
+                return
+            n_pruned_list.append(n_pruned)
+
+        topk_imp_list = []
+        for i, im in enumerate(imp_list):
+            topk_imp, _ = torch.topk(im, k=n_pruned_list[i], largest=False)
+            topk_imp_list.append(topk_imp)
+
+        # semi-global pruning through thresholding
+        thres_list = []
+        for topk_imp in topk_imp_list:
+            thres_list.append(topk_imp[-1])
+        idx = 0
+        for group, ch_groups, imp in global_importance:
+            module = group[0][0].target.module
+            pruning_fn = group[0][0].handler
+            # thres_idx = int(idx / (len(global_importance) / len(splits)))
+            if idx in backbone_indices:
+                thres_idx = 0
+            elif idx in neck_indices:
+                thres_idx = 1
+            else:
+                thres_idx = 2
+
+            print(thres_idx)
+            pruning_indices = (imp <= thres_list[thres_idx]).nonzero().view(-1)
+
+            if ch_groups > 1:
+                group_size = self.DG.get_out_channels(module) // ch_groups
+                pruning_indices = torch.cat([pruning_indices + group_size * i for i in range(ch_groups)], 0)
+            if self.round_to:
+                n_pruned = len(pruning_indices)
+                n_pruned = n_pruned - (n_pruned % self.round_to)
+                pruning_indices = pruning_indices[:n_pruned]
+            group = self.DG.get_pruning_group(module, pruning_fn, pruning_indices.tolist())
+            if self.DG.check_pruning_group(group):
+                group.exec()
+            idx += 1

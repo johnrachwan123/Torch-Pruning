@@ -1,16 +1,18 @@
 import sys, os
+from typing import Callable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-
+sys.path.append('/nfs/homedirs/rachwan/Torch-Pruning')
 from functools import partial
 import argparse
+import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import torch_pruning as tp
-import engine.utils as utils
 import registry
+import engine.utils as utils
 
 parser = argparse.ArgumentParser()
 
@@ -41,7 +43,8 @@ parser.add_argument("--sl-total-epochs", type=int, default=100, help="epochs for
 parser.add_argument("--sl-lr", default=0.01, type=float, help="learning rate for sparsity learning")
 parser.add_argument("--sl-lr-decay-milestones", default="60,80", type=str, help="milestones for sparsity learning")
 parser.add_argument("--sl-reg-warmup", type=int, default=0, help="epochs for sparsity learning")
-parser.add_argument("--sl-restore", type=str, default=None)
+#parser.add_argument("--sl_restore", type=str, default=None)
+parser.add_argument("--sl-restore", action="store_true", default=False)
 parser.add_argument("--iterative-steps", default=400, type=int)
 
 args = parser.parse_args()
@@ -154,11 +157,23 @@ def train_model(
     args.logger.info("Best Acc=%.4f" % (best_acc))
 
 
-def get_pruner(model, example_inputs):
+def get_pruner(model, example_inputs, args, loader):
     args.sparsity_learning = False
     if args.method == "random":
         imp = tp.importance.RandomImportance()
         pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
+    elif args.method == "snip":
+        imp = tp.importance.SensitivityImportance()
+        pruner_entry = partial(tp.pruner.GradientPruner, global_pruning=args.global_pruning, crit='SNIP',
+                               dataloader=loader, Loss=torch.nn.CrossEntropyLoss())
+    elif args.method == "crop":
+        imp = tp.importance.SensitivityImportance()
+        pruner_entry = partial(tp.pruner.GradientPruner, global_pruning=args.global_pruning, crit='CROP',
+                               dataloader=loader, Loss=torch.nn.CrossEntropyLoss())
+    elif args.method == "synflow":
+        imp = tp.importance.SensitivityImportance()
+        pruner_entry = partial(tp.pruner.GradientPruner, global_pruning=args.global_pruning, crit='SYNFLOW',
+                               dataloader=loader)
     elif args.method == "l1":
         imp = tp.importance.MagnitudeImportance(p=1)
         pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
@@ -245,8 +260,9 @@ def main():
     for k, v in utils.utils.flatten_dict(vars(args)).items():  # print args
         args.logger.info("%s: %s" % (k, v))
 
-    if args.restore is not None:
-        loaded = torch.load(args.restore, map_location="cpu")
+    if args.restore:
+        model_location = '/nfs/homedirs/rachwan/Torch-Pruning/benchmarks/run/' + args.dataset + '/pretrain/'
+        loaded = torch.load(model_location + args.dataset + '_' + args.model + '.pth', map_location="cpu")
         if isinstance(loaded, nn.Module):
             model = loaded
         else:
@@ -273,7 +289,9 @@ def main():
             test_loader=test_loader
         )
     elif args.mode == "prune":
-        pruner = get_pruner(model, example_inputs=example_inputs)
+        model.eval()
+        pruner = get_pruner(model, example_inputs=example_inputs, args=args, loader=train_loader)
+
         # 0. Sparsity Learning
         if args.sparsity_learning:
             reg_pth = "reg_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.reg)

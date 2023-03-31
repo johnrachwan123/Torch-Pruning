@@ -1,0 +1,89 @@
+seml:
+  executable: main_seml.py
+  name: computer_vision_pruning
+  output_dir: logs/
+  project_root_dir: .
+  conda_environment: structure_pruning
+
+slurm:
+  #TODO : Increase to 8
+  experiments_per_job: 1
+  sbatch_options:
+    gres: gpu:1       # num GPUs
+    mem: 32G          # memory
+#    exclude: gpu[15-19]
+    cpus-per-task: 1  # num cores
+    time: 0-24:00     # max time, D-HH:MM
+    partition: ['gpu_all']
+    #TODO Change to PHD prio
+    qos: phd
+#    qos: interactive
+
+###### BEGIN PARAMETER CONFIGURATION ######
+
+fixed:
+  arguments:
+    mode: prune
+    verbose: False
+    dataset: cifar100
+    batch_size: 128
+    total_epochs: 100
+    lr_decay_milestones: 60|80
+    lr_decay_gamma: 0.1
+    lr: 0.01
+    restore: True
+    output_dir: run
+    max_sparsity: 1.0
+    soft_keeping_ratio: 0.0
+    reg: 5e-4
+    weight_decay: 5e-4
+    seed: None
+    global_pruning: True
+    sl_total_epochs: 100
+    sl_lr: 0.01
+    sl_lr_decay_milestones: 60|80
+    sl_reg_warmup: 0
+    sl_restore: False
+    iterative_steps: 400
+#    method: None
+#    speed_up: 2
+
+grid:
+  arguments:
+    model:
+      type: choice
+      options:
+#        - resnet50
+#        - vgg19
+#        - densenet169
+#        - googlenet
+#        - mobilenetv2
+#        - preactresnet50
+#        - resnet56
+#        - inceptionv3
+        - resnext50
+#
+    method:
+      type: choice
+      options:
+        - l1
+        - snip
+        - crop
+        - synflow
+        - random
+        - lamp
+        - slim
+        - groupnorm
+        - group_sl
+    speed_up:
+      type: choice
+      options:
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10

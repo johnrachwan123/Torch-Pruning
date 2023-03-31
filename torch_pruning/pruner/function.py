@@ -210,9 +210,9 @@ class LayernormPruner(BasePruningFunc):
         keep_idxs.sort()
         if layer.elementwise_affine:
             layer.weight = torch.nn.Parameter(
-                layer.weight.data.clone().index_select(pruning_dim, keep_idxs))
+                layer.weight.data.clone().index_select(pruning_dim, keep_idxs.to(layer.weight.device)))
             layer.bias = torch.nn.Parameter(
-                layer.bias.data.clone().index_select(pruning_dim, keep_idxs))
+                layer.bias.data.clone().index_select(pruning_dim, keep_idxs.to(layer.weight.device)))
         if pruning_dim != -1:
             layer.normalized_shape = layer.normalized_shape[:pruning_dim] + (
                 keep_idxs.size(0), ) + layer.normalized_shape[pruning_dim+1:]
@@ -337,7 +337,7 @@ class ParameterPruner(BasePruningFunc):
         keep_idxs = list(set(range(tensor.data.shape[self.dim])) - set(idxs))
         keep_idxs.sort()
         tensor.data = torch.index_select(
-            tensor.data, self.dim, torch.LongTensor(keep_idxs))
+            tensor.data, self.dim, torch.LongTensor(keep_idxs).to(tensor.data.device))
         return tensor
 
     prune_in_channels = prune_out_channels
@@ -377,20 +377,20 @@ class MultiheadAttentionPruner(BasePruningFunc):
         keep_idxs_3x_repeated.sort()
         if layer.in_proj_weight is not None:
             layer.in_proj_weight.data = torch.index_select(
-                layer.in_proj_weight.data, 0, torch.LongTensor(keep_idxs_3x_repeated))
+                layer.in_proj_weight.data, 0, torch.LongTensor(keep_idxs_3x_repeated).to(layer.in_proj_weight.data.device))
             layer.in_proj_weight.data = torch.index_select(
-                layer.in_proj_weight.data, 1, torch.LongTensor(keep_idxs))
+                layer.in_proj_weight.data, 1, torch.LongTensor(keep_idxs).to(layer.in_proj_weight.data.device))
 
         if layer.in_proj_bias is not None:
             layer.in_proj_bias.data = torch.index_select(
-                layer.in_proj_bias.data, 0, torch.LongTensor(keep_idxs_3x_repeated))
+                layer.in_proj_bias.data, 0, torch.LongTensor(keep_idxs_3x_repeated).to(layer.in_proj_bias.data.device))
 
         if layer.bias_k is not None:
             layer.bias_k.data = torch.index_select(
-                layer.bias_k.data, 2, torch.LongTensor(keep_idxs))
+                layer.bias_k.data, 2, torch.LongTensor(keep_idxs).to(layer.bias_k.data.device))
         if layer.bias_v is not None:
             layer.bias_v.data = torch.index_select(
-                layer.bias_v.data, 2, torch.LongTensor(keep_idxs))
+                layer.bias_v.data, 2, torch.LongTensor(keep_idxs).to(layer.bias_v.data.device))
 
         linear = layer.out_proj
         keep_idxs = list(set(range(linear.out_features)) - set(idxs))

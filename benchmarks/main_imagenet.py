@@ -97,19 +97,20 @@ def get_args_parser(add_help=True):
     parser.add_argument("--sl-lr-warmup-epochs", default=None, type=int, help="the number of epochs to warmup (default: 0)")
     return parser
 
-def prune_to_target_flops(pruner, model, target_flops, example_inputs):
+def prune_to_target_flops(pruner, model, speed_up, example_inputs):
     model.eval()
-    ori_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
-    pruned_ops = ori_ops
-    while pruned_ops / 1e9 > target_flops:
+    base_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+    current_speed_up = 1
+    while current_speed_up < speed_up:
         pruner.step()
         if 'vit' in args.model:
             model.hidden_dim = model.conv_proj.out_channels
+        model.cpu()
         pruned_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
-        
+        current_speed_up = float(base_ops) / pruned_ops
     return pruned_ops
 
-def get_pruner(model, example_inputs, args):
+def get_pruner(model, example_inputs, args, loader):
     unwrapped_parameters = (
         [model.encoder.pos_embedding, model.class_token] if "vit" in args.model else None
     )
@@ -118,6 +119,18 @@ def get_pruner(model, example_inputs, args):
     if args.method == "random":
         imp = tp.importance.RandomImportance()
         pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
+    elif args.method == "snip":
+        imp = tp.importance.SensitivityImportance()
+        pruner_entry = partial(tp.pruner.GradientPruner, global_pruning=args.global_pruning, crit='SNIP',
+                               dataloader=loader, Loss=torch.nn.CrossEntropyLoss())
+    elif args.method == "crop":
+        imp = tp.importance.SensitivityImportance()
+        pruner_entry = partial(tp.pruner.GradientPruner, global_pruning=args.global_pruning, crit='CROP',
+                               dataloader=loader, Loss=torch.nn.CrossEntropyLoss())
+    elif args.method == "synflow":
+        imp = tp.importance.SensitivityImportance()
+        pruner_entry = partial(tp.pruner.GradientPruner, global_pruning=args.global_pruning, crit='SYNFLOW',
+                               dataloader=loader)
     elif args.method == "l1":
         imp = tp.importance.MagnitudeImportance(p=1)
         pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
@@ -304,20 +317,19 @@ def load_data(traindir, valdir, args):
             utils.save_on_master((dataset_test, valdir), cache_path)
 
     print("Creating data loaders...")
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+    # if args.distributed:
+    #     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    #     test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
+    # else:
+    train_sampler = torch.utils.data.RandomSampler(dataset)
+    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
     return dataset, dataset_test, train_sampler, test_sampler
 
 def main(args):
-    if args.output_dir:
-        utils.mkdir(args.output_dir)
+    args.output_dir = os.path.join('/nfs/homedirs/rachwan/Torch-Pruning/benchmarks/run/imagenet/prune/','')
 
-    utils.init_distributed_mode(args)
+    # utils.init_distributed_mode(args)
     print(args)
 
     device = torch.device(args.device)
@@ -367,7 +379,7 @@ def main(args):
     print("ops: {:.4f} G".format(base_ops / 1e9))
     print("="*16)
     if args.prune:
-        pruner = get_pruner(model, example_inputs=example_inputs, args=args)
+        pruner = get_pruner(model, example_inputs=example_inputs, args=args, loader=data_loader)
         if args.sparsity_learning:
             if args.sl_resume:
                 print("Loading sparse model from {}...".format(args.sl_resume))
@@ -381,7 +393,7 @@ def main(args):
                 train(model, args.sl_epochs, 
                                         lr=args.sl_lr, lr_step_size=args.sl_lr_step_size, lr_warmup_epochs=args.sl_lr_warmup_epochs, 
                                         train_sampler=train_sampler, data_loader=data_loader, data_loader_test=data_loader_test, 
-                                        device=device, args=args, regularizer=pruner.regularize, state_dict_only=True)
+                                        device=device, args=args, regularizer=pruner.regularize, state_dict_only=(not args.prune))
                 #model.load_state_dict( torch.load('regularized_{:.4f}_best.pth'.format(args.reg), map_location='cpu')['model'] )
                 #utils.save_on_master(
                 #    model_without_ddp.state_dict(),
@@ -413,8 +425,8 @@ def train(
     device, args, regularizer=None, state_dict_only=True, recover=None):
 
     model.to(device)
-    if args.distributed and args.sync_bn:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # if args.distributed and args.sync_bn:
+    #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     if args.label_smoothing>0:
         criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -493,9 +505,9 @@ def train(
         lr_scheduler = main_lr_scheduler
 
     model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    #     model_without_ddp = model.module
 
     model_ema = None
     if args.model_ema:
@@ -536,8 +548,8 @@ def train(
     best_acc = 0
     prefix = '' if regularizer is None else 'regularized_{:e}_'.format(args.reg)
     for epoch in range(args.start_epoch, epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
+        # if args.distributed:
+        #     train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler, regularizer, recover=recover)
         lr_scheduler.step()
         acc = evaluate(model, criterion, data_loader_test, device=device)
@@ -557,8 +569,8 @@ def train(
                 checkpoint["scaler"] = scaler.state_dict()
             if acc>best_acc:
                 best_acc=acc
-                utils.save_on_master(checkpoint, os.path.join(args.output_dir, prefix+"best.pth"))
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, prefix+"latest.pth"))
+                utils.save_on_master(checkpoint, os.path.join(args.output_dir, prefix+"{}_{}_{}_best.pth".format(args.model, args.method, args.target_flops)))
+            utils.save_on_master(checkpoint, os.path.join(args.output_dir, prefix+"{}_{}_{}_latest.pth".format(args.model, args.method, args.target_flops)))
         print("Epoch {}/{}, Current Best Acc = {:.6f}".format(epoch, epochs, best_acc))
 
     total_time = time.time() - start_time

@@ -68,7 +68,6 @@ MODEL_DICT = {
 
     'xception': models.cifar.xception.xception,
     
-    'vit_cifar': models.cifar.vit.vit_cifar,
     'swin_t': models.cifar.swin.swin_t,
     'swin_s': models.cifar.swin.swin_s,
     'swin_b': models.cifar.swin.swin_b,
