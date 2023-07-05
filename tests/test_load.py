@@ -6,7 +6,7 @@ import torch
 from torchvision.models import resnet18 as entry
 import torch_pruning as tp
 
-def test_interactive_pruner():
+def test_pruner():
     model = entry()
     print(model)
     # Global metrics
@@ -31,10 +31,7 @@ def test_interactive_pruner():
 
     base_macs, base_nparams = tp.utils.count_ops_and_params(model, example_inputs)
     for i in range(iterative_steps):
-        for group in pruner.step(interactive=True):
-            print(group)
-            group.prune()
-            
+        pruner.step()
         macs, nparams = tp.utils.count_ops_and_params(model, example_inputs)
         print(model)
         print(model(example_inputs).shape)
@@ -46,9 +43,19 @@ def test_interactive_pruner():
             "  Iter %d/%d, MACs: %.2f G => %.2f G"
             % (i+1, iterative_steps, base_macs / 1e9, macs / 1e9)
         )
-        # finetune your model here
-        # finetune(model)
-        # ...
-        
+    
+    state_dict = {
+        'model': model.state_dict(),
+        'pruning': pruner.pruning_history(),
+    }
+    torch.save(state_dict, 'pruned_model.pth')
+    # Create a new model and pruner
+    model = entry()
+    DG = tp.DependencyGraph().build_dependency(model, example_inputs)
+    state_dict = torch.load('pruned_model.pth')
+    DG.load_pruning_history(state_dict['pruning'])
+    model.load_state_dict(state_dict['model'])
+    print(model)
+
 if __name__=='__main__':
-    test_interactive_pruner()
+    test_pruner()

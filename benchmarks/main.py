@@ -57,6 +57,8 @@ def progressive_pruning(pruner, model, speed_up, example_inputs):
         pruner.step(interactive=False)
         pruned_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         current_speed_up = float(base_ops) / pruned_ops
+        if pruner.current_step == pruner.iterative_steps:
+            break
         #print(current_speed_up)
     return current_speed_up
 
@@ -100,7 +102,7 @@ def train_model(
         model.parameters(),
         lr=lr,
         momentum=0.9,
-        weight_decay=weight_decay,
+        weight_decay=weight_decay if pruner is None else 0,
     )
     milestones = [int(ms) for ms in lr_decay_milestones.split(",")]
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -179,7 +181,7 @@ def get_pruner(model, example_inputs, args, loader):
         pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
     elif args.method == "lamp":
         imp = tp.importance.LAMPImportance(p=2)
-        pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
+        pruner_entry = partial(tp.pruner.BNScalePruner, global_pruning=args.global_pruning)
     elif args.method == "slim":
         args.sparsity_learning = True
         imp = tp.importance.BNScaleImportance()
