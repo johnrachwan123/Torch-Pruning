@@ -204,6 +204,23 @@ class Group(object):
         fmt += "-" * 32 + "\n"
         return fmt
 
+    def has_layer(self, layer):
+        """Check if a layer exists in the group.
+
+        Args:
+            layer: The layer to check for.
+
+        Returns:
+            bool: True if the layer exists in the group, False otherwise.
+        """
+        for dep, _ in self._group:
+            if dep.target.module == layer:
+                if dep.handler.__name__ is None:
+                    import pdb
+                    pdb.set_trace()
+                return dep.handler.__name__
+        return None
+
     def details(self):
         fmt = ""
         fmt += "\n" + "-" * 32 + "\n"
@@ -373,19 +390,12 @@ class DependencyGraph(object):
                 dep, idxs = processing_stack.pop(-1)
                 node, fn = dep.target, dep.handler
                 visited_node.add(node)
-
                 for new_dep in node.dependencies:
                     if new_dep.is_triggered_by(fn):
-                        new_indices = (
-                            new_dep.index_mapping(idxs)
-                            if new_dep.index_mapping is not None
-                            else idxs
-                        )
+                        new_indices = (new_dep.index_mapping(idxs)if new_dep.index_mapping is not None else idxs)
                         if len(new_indices) == 0:
                             continue
-                        if (new_dep.target in visited_node) and group.has_pruning_op(
-                            new_dep, new_indices
-                        ):
+                        if (new_dep.target in visited_node) and group.has_pruning_op(new_dep, new_indices):
                             continue
                         else:
                             group.add_dep(new_dep, new_indices)
@@ -405,10 +415,11 @@ class DependencyGraph(object):
     def get_all_groups(self, ignored_layers=[], root_module_types=(ops.TORCH_CONV, ops.TORCH_LINEAR)):
         visited_layers = []
         ignored_layers = ignored_layers+self.IGNORED_LAYERS
+        # import pdb
+        # pdb.set_trace()
         for m in self.module2node.keys():
             if m in ignored_layers:
                 continue
-
             if not isinstance(m, tuple(root_module_types)):
                 continue
 
@@ -543,28 +554,28 @@ class DependencyGraph(object):
         model.eval()
         gradfn2module = {}
         visited = {}
-
+        self._2d_4d = True  # CNNs or Transformer, only for pytorch<=1.8
         def _record_grad_fn(module, inputs, outputs):
+            # pdb.set_trace()
             if module not in visited:
                 visited[module] = 1
             else:
                 visited[module] += 1
-
+            if isinstance(module, ops.TORCH_LINEAR) and len(inputs[0].shape) == 3:
+                self._2d_4d = False
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
             if isinstance(outputs, torch.nn.utils.rnn.PackedSequence):
                 outputs = outputs.data
             gradfn2module[outputs.grad_fn] = module
 
-        registered_types = tuple(ops.type2class(
-            t) for t in self.REGISTERED_PRUNERS.keys()) + tuple(self.CUSTOMIZED_PRUNERS.keys())
-        hooks = [
-            m.register_forward_hook(_record_grad_fn)
-            for m in model.modules()
-            if (isinstance(m, registered_types) and m not in self.IGNORED_LAYERS)
-        ]
+        registered_types = tuple(ops.type2class(t) for t in self.REGISTERED_PRUNERS.keys()) + tuple(self.CUSTOMIZED_PRUNERS.keys())
+        # import pdb
+        # pdb.set_trace()
+        hooks = [m.register_forward_hook(_record_grad_fn) for m in model.modules() if (isinstance(m, registered_types) and m not in self.IGNORED_LAYERS)]
 
         # Feed forward and record gradient functions of prunable modules
+        model.train()
         if forward_fn is not None:
             out = forward_fn(model, example_inputs)
         elif isinstance(example_inputs, dict):
@@ -585,6 +596,8 @@ class DependencyGraph(object):
             out = output_transform(out)
 
         module2node = {}
+        # import pdb
+        # pdb.set_trace()
         for o in utils.flatten_as_list(out):
             self._trace_computational_graph(
                 module2node, o.grad_fn, gradfn2module, reused)
@@ -634,7 +647,7 @@ class DependencyGraph(object):
                 elif "view" in grad_fn.name().lower() or 'reshape' in grad_fn.name().lower():
                     module = ops._ReshapeOp()
                 else:
-                    # treate other ops as element-wise ones, like Add, Sub, Div, Mul.
+                    # treat other ops as element-wise ones, like Add, Sub, Div, Mul.
                     module = ops._ElementWiseOp(grad_fn.name())
                 gradfn2module[grad_fn] = module
 
@@ -657,6 +670,8 @@ class DependencyGraph(object):
         # non-recursive construction of computational graph
         processing_stack = [grad_fn_root]
         visited = set()
+        # import pdb
+        # pdb.set_trace()
         while len(processing_stack) > 0:
             grad_fn = processing_stack.pop(-1)
             if grad_fn in visited:
@@ -745,10 +760,14 @@ class DependencyGraph(object):
         if out_channels==in_channels: return
 
         # Only Supports 2D/4D tensors
-        if len(reshape_node.grad_fn._saved_self_sizes)!=1 and len(reshape_node.grad_fn._saved_self_sizes)!=4:
-            return
-        
-        # Flatten
+        if hasattr(reshape_node.grad_fn, '_saved_self_sizes'):
+            if len(reshape_node.grad_fn._saved_self_sizes) != 1 and len(reshape_node.grad_fn._saved_self_sizes) != 4:
+                return
+        else:  # old pytorch versions
+            if not self._2d_4d:
+                return
+
+                # Flatten
         if out_channels > in_channels:
              for in_node in reshape_node.inputs:
                 for dep in reshape_node.dependencies:

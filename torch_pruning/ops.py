@@ -1,6 +1,6 @@
 import torch.nn as nn
 from enum import IntEnum
-
+import transformers
 
 class DummyMHA(nn.Module):
     def __init__(self):
@@ -31,6 +31,7 @@ class _SplitOp(nn.Module):
 
     def __repr__(self):
         return "_SplitOp({})".format(self.offsets)
+
 
 class _ReshapeOp(nn.Module):
     def __init__(self):
@@ -70,8 +71,10 @@ class DummyPruner(object):
 class ConcatPruner(DummyPruner):
     pass
 
+
 class ReshapePruner(DummyPruner):
     pass
+
 
 class SplitPruner(DummyPruner):
     pass
@@ -79,6 +82,8 @@ class SplitPruner(DummyPruner):
 
 class ElementWisePruner(DummyPruner):
     pass
+
+
 
 
 # Standard Modules
@@ -90,6 +95,8 @@ TORCH_LINEAR = nn.Linear
 TORCH_EMBED = nn.Embedding
 TORCH_PARAMETER = nn.Parameter
 TORCH_LSTM = nn.LSTM
+TORCH_GROUPNORM = nn.modules.normalization.GroupNorm
+
 try:
     TORCH_MHA = nn.MultiheadAttention
 except:
@@ -113,6 +120,8 @@ class OPTYPE(IntEnum):
     MHA = 12
     LSTM = 13
     RESHAPE = 14
+    GROUPNORM = 15
+    OPTAttention = 16
 
 
 def module2type(module):
@@ -139,18 +148,22 @@ def module2type(module):
         return OPTYPE.CUSTOMIZED
     elif isinstance(module, nn.Parameter):
         return OPTYPE.PARAMETER
-    elif isinstance(module, TORCH_MHA):
+    elif isinstance(module, TORCH_MHA) or isinstance(module, transformers.models.opt.modeling_opt.OPTAttention):
+        import pdb
+        pdb.set_trace()
         return OPTYPE.MHA
     elif isinstance(module, TORCH_LSTM):
         return OPTYPE.LSTM
     elif isinstance(module, _ReshapeOp):
         return OPTYPE.RESHAPE
+    elif isinstance(module, TORCH_GROUPNORM):
+        return OPTYPE.GROUPNORM
     else:
         return OPTYPE.ELEMENTWISE
 
 
 def type2class(op_type):
-    if op_type == OPTYPE.CONV or op_type==OPTYPE.DEPTHWISE_CONV:
+    if op_type == OPTYPE.CONV or op_type == OPTYPE.DEPTHWISE_CONV:
         return TORCH_CONV
     elif op_type == OPTYPE.BN:
         return TORCH_BATCHNORM
@@ -174,8 +187,9 @@ def type2class(op_type):
         return TORCH_MHA
     elif op_type == OPTYPE.LSTM:
         return TORCH_LSTM
-    elif OPTYPE == OPTYPE.RESHAPE:
+    elif op_type == OPTYPE.RESHAPE:
         return _ReshapeOp
+    elif op_type == OPTYPE.GROUPNORM:
+        return TORCH_GROUPNORM
     else:
         return _ElementWiseOp
-

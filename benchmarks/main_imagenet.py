@@ -97,6 +97,17 @@ def get_args_parser(add_help=True):
     parser.add_argument("--sl-lr-warmup-epochs", default=None, type=int, help="the number of epochs to warmup (default: 0)")
     return parser
 
+from torchvision.datasets import ImageFolder
+import torchvision.transforms as transforms
+
+class InMemoryImageFolder(ImageFolder):
+    def __init__(self, root, transform=None, target_transform=None):
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        self.data = [(self.transform(self.loader(img_path)), target) for img_path, target in self.imgs]
+
+    def __getitem__(self, index):
+        return self.data[index]
+
 def prune_to_target_flops(pruner, model, speed_up, example_inputs):
     model.eval()
     base_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
@@ -148,6 +159,9 @@ def get_pruner(model, example_inputs, args, loader):
         sparsity_learning = True
         imp = tp.importance.GroupNormImportance(p=2)
         pruner_entry = partial(tp.pruner.GroupNormPruner, reg=args.reg, global_pruning=args.global_pruning)
+    elif args.method == 'obc':
+        imp = tp.importance.OBCImportance()
+        pruner_entry = partial(tp.pruner.MagnitudePruner, global_pruning=args.global_pruning)
     else:
         raise NotImplementedError
     args.data_dependency = data_dependency
@@ -291,7 +305,7 @@ def load_data(traindir, valdir, args):
     else:
         auto_augment_policy = getattr(args, "auto_augment", None)
         random_erase_prob = getattr(args, "random_erase", 0.0)
-        dataset = torchvision.datasets.ImageFolder(
+        dataset = InMemoryImageFolder(
             traindir,
             presets.ClassificationPresetTrain(crop_size=crop_size, auto_augment_policy=auto_augment_policy,
                                               random_erase_prob=random_erase_prob))
@@ -308,7 +322,7 @@ def load_data(traindir, valdir, args):
         print("Loading dataset_test from {}".format(cache_path))
         dataset_test, _ = torch.load(cache_path)
     else:
-        dataset_test = torchvision.datasets.ImageFolder(
+        dataset_test = InMemoryImageFolder(
             valdir,
             presets.ClassificationPresetEval(crop_size=crop_size, resize_size=resize_size))
         if args.cache_dataset:
@@ -342,6 +356,14 @@ def main(args):
 
     train_dir = os.path.join(args.data_path, "train")
     val_dir = os.path.join(args.data_path, "val")
+    import psutil
+
+    # Get the current memory usage in bytes
+    mem = psutil.virtual_memory().used
+
+    # Print the memory usage in a human-readable format
+    print(f"Current memory usage: {psutil._common.bytes2human(mem)}")
+
     dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, args)
 
     collate_fn = None
@@ -368,6 +390,14 @@ def main(args):
     data_loader_test = torch.utils.data.DataLoader(
         dataset_test, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.workers, pin_memory=True
     )
+    import psutil
+
+    # Get the current memory usage in bytes
+    mem = psutil.virtual_memory().used
+
+    # Print the memory usage in a human-readable format
+    print(f"Current memory usage: {psutil._common.bytes2human(mem)}")
+
     print("Creating model")
     model = registry.get_model(num_classes=1000, name=args.model, pretrained=args.pretrained, target_dataset='imagenet') #torchvision.models.__dict__[args.model](pretrained=args.pretrained) #torchvision.models.get_model(args.model, weights=args.weights, num_classes=num_classes)
     model.eval()

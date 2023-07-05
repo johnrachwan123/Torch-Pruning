@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 from .. import ops
 
@@ -164,6 +165,26 @@ class LinearPruner(BasePruningFunc):
     def get_in_channels(self, layer):
         return layer.in_features
 
+# GroupNormPruner
+class GroupNormPruner(BasePruningFunc):
+    TARGET_MODULES = ops.TORCH_GROUPNORM
+
+    def prune_out_channels(self, layer: nn.Module, idxs: Sequence[int]) -> nn.Module:
+        keep_idxs = list(set(range(layer.num_channels )) - set(idxs))
+        keep_idxs.sort()
+        layer.num_channels  = len(keep_idxs)
+        layer.weight = torch.nn.Parameter(layer.weight.data.clone()[keep_idxs])
+        layer.bias = torch.nn.Parameter(layer.bias.data.clone()[keep_idxs])
+
+        return layer
+
+    prune_in_channels = prune_out_channels
+
+    def get_out_channels(self, layer):
+        return layer.num_channels
+
+    def get_in_channels(self, layer):
+        return layer.num_channels
 
 class BatchnormPruner(BasePruningFunc):
     TARGET_MODULES = ops.TORCH_BATCHNORM
@@ -430,7 +451,9 @@ PrunerBox = {
     ops.OPTYPE.EMBED: EmbeddingPruner(),
     ops.OPTYPE.PARAMETER: ParameterPruner(),
     ops.OPTYPE.MHA: MultiheadAttentionPruner(),
-    ops.OPTYPE.LSTM: LSTMPruner()
+    ops.OPTYPE.OPTAttention: MultiheadAttentionPruner(),
+    ops.OPTYPE.LSTM: LSTMPruner(),
+    ops.OPTYPE.GROUPNORM: GroupNormPruner()
 }
 
 

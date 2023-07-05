@@ -4,7 +4,7 @@ import typing
 
 from .scheduler import linear_scheduler
 from ..import function
-from ... import ops, dependency
+from ... import ops, dependency, sparsegpt_structured
 
 
 class MetaPruner:
@@ -23,7 +23,7 @@ class MetaPruner:
             max_ch_sparsity (float): maximum channel sparsity.
             ignored_layers (List[nn.Module]): ignored modules.
 
-            round_to (int): channel rounding.
+            round_to (int): channel rounding (Channels to keep) .
             customized_pruners (dict): a dict containing module-pruner pairs.
             unwrapped_parameters (list): nn.Parameter that does not belong to any supported layerss.
             root_module_types (list): types of prunable modules.
@@ -144,6 +144,28 @@ class MetaPruner:
                     and m.groups != m.out_channels:
                 self.channel_groups[m] = m.groups
 
+        # detect group norms
+        self.round_to = 0 if self.round_to==None else round_to
+        for m in self.model.modules():
+            if isinstance(m, ops.TORCH_GROUPNORM):
+                self.round_to = m.num_groups
+
+        #         self.channel_groups[m] = m.num_groups
+
+        # detect transformer heads
+        #TODO this isnt working because when we have both group norm and attention then there is 2 different round-to
+        import diffusers
+        def gcd(a, b):
+            while b:
+                a, b = b, a % b
+            return a
+
+        def lcm(a, b):
+            return abs(a * b) // gcd(a, b)
+        for m in self.model.modules():
+            if hasattr(m, 'attn_num_head_channels'):
+                self.round_to = lcm(m.attn_num_head_channels, self.round_to)
+
         if self.global_pruning:
             initial_total_channels = 0
             for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types):
@@ -187,6 +209,12 @@ class MetaPruner:
                 for group in self.prune_local():
                     group.prune()
 
+    def get_indices(self, sparsity, num_heads):
+        indices = {}
+        for idx, group in self.indices(sparsity, num_heads):
+            indices[group] = idx
+        return indices
+
     def estimate_importance(self, group, ch_groups=1):
         return self.importance(group, ch_groups=ch_groups)
 
@@ -220,6 +248,119 @@ class MetaPruner:
             if module in self.channel_groups:
                 return self.channel_groups[module]
         return 1  # no channel grouping
+
+    def prune(self, indices):
+        num_pruned = 0
+        for group in self.prune_index(indices):
+            # print(group)
+            # if num_pruned < 10:
+            group.prune()
+                # num_pruned += 1
+            # else:
+            #     break
+
+    def prune_index(self, indices):
+
+        for group in indices.keys():
+            # check pruning rate
+            if self._check_sparsity(group):
+                module = group[0][0].target.module
+                pruning_fn = group[0][0].handler
+                pruning_idxs = indices[group]
+                # import pdb
+                # pdb.set_trace()
+                g = self.DG.get_pruning_group(module, pruning_fn, pruning_idxs.tolist())
+                if self.DG.check_pruning_group(g):
+                    yield g
+
+
+    def indices(self, sparsity, num_heads):
+        if self.current_step > self.iterative_steps:
+            return
+        for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers,
+                                            root_module_types=self.root_module_types):
+            # check pruning rate
+            if self._check_sparsity(group):
+                module = group[0][0].target.module
+                pruning_fn = group[0][0].handler
+
+                ch_groups = self.get_channel_groups(group)
+                if self.backward_needed == True:
+                    # Suboptimal since it recalculates scores for every layer
+                    self.pre_prune(pruning_batch_size=self.pruning_batch_size, iterations=self.iterations,
+                                   yolo=self.yolo)
+                # TODO: Here the importance should be extracted from the sparsegpt one
+                imp = self.estimate_importance(group, ch_groups=ch_groups)
+                if len(imp) == 0:
+                    yield torch.tensor([]), group
+                    print(group)
+                    continue
+                current_channels = self.DG.get_out_channels(module)
+                # TODO: Fix this, not harcoded
+                target_sparsity = sparsity
+                n_pruned = int(self.layer_init_out_ch[module] * target_sparsity)
+
+                if self.round_to:
+                    # Calculate the remainder after dividing (current_channels - n_pruned) by self.round_to
+                    remainder = (current_channels - n_pruned) % self.round_to
+
+                    # If there is a remainder, add it to n_pruned to make (current_channels - n_pruned) a multiple of self.round_to
+                    if remainder:
+                        n_pruned += remainder
+
+                if ch_groups > 1:
+                    imp = imp[:len(imp) // ch_groups]
+
+                def sort_indices_by_group_products(tensor, group_size):
+                    def group_elements(tensor, group_size):
+                        if group_size <= 0:
+                            raise ValueError("Group size must be a positive integer.")
+
+                        grouped_elements = []
+                        for i in range(0, len(tensor), group_size):
+                            group = tensor[i:i + group_size]
+                            grouped_elements.append(group)
+
+                        return grouped_elements
+
+                    def product_of_groups(grouped_list):
+                        products = []
+                        for group in grouped_list:
+                            product = 1
+                            for element in group:
+                                product *= element
+                            products.append(product)
+
+                        return products
+
+                    grouped_list = group_elements(tensor, group_size)
+                    products_list = product_of_groups(grouped_list)
+                    sorted_indices = sorted(range(len(products_list)), key=lambda i: products_list[i])
+
+                    original_indices = []
+                    for index in sorted_indices:
+                        group_original_indices = list(range(index * group_size, (index * group_size) + group_size))
+                        # Clip the indices to the length of the original tensor
+                        group_original_indices = [i for i in group_original_indices if i < len(tensor)]
+                        original_indices.extend(group_original_indices)
+
+                    return original_indices
+                import pdb
+                for name, m in self.model.named_modules():
+                    if m == module:
+                        break
+                if any(substring in name for substring in ('k_proj', 'v_proj', 'q_proj', 'out_proj')):
+                    imp_argsort = torch.tensor(sort_indices_by_group_products(imp, num_heads))
+                else:
+                    imp_argsort = torch.argsort(imp)
+                # TODO: Here we should call the sparsegpt algorithm with the given mask to fix the other weights before structured pruning
+                pruning_idxs = imp_argsort[:(n_pruned // ch_groups)]
+                if ch_groups > 1:
+                    group_size = current_channels // ch_groups
+                    pruning_idxs = torch.cat(
+                        [pruning_idxs + group_size * i for i in range(ch_groups)], 0)
+
+                yield pruning_idxs.to(torch.long), group
 
     def prune_local_index(self, index, nb_parameters=10):
         if self.current_step >= self.iterative_steps:
@@ -275,6 +416,8 @@ class MetaPruner:
         return id
 
     def prune_local(self):
+        # import pdb
+        # pdb.set_trace()
         if self.current_step > self.iterative_steps:
             return
         for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers, root_module_types=self.root_module_types):
@@ -288,6 +431,7 @@ class MetaPruner:
                     # Suboptimal since it recalculates scores for every layer
                     self.pre_prune(pruning_batch_size=self.pruning_batch_size, iterations=self.iterations,
                                    yolo=self.yolo)
+                #TODO: Here the importance should be extracted from the sparsegpt one
                 imp = self.estimate_importance(group, ch_groups=ch_groups)
                 current_channels = self.DG.get_out_channels(module)
                 target_sparsity = self.get_target_sparsity(module)
@@ -297,6 +441,7 @@ class MetaPruner:
                 )
 
                 if self.round_to:
+                    #TODO: This might be logically incorrect, see indices method
                     n_pruned = n_pruned - (n_pruned % self.round_to)
 
                 if n_pruned <= 0:
@@ -304,6 +449,7 @@ class MetaPruner:
                 if ch_groups > 1:
                     imp = imp[:len(imp)//ch_groups]
                 imp_argsort = torch.argsort(imp)
+                #TODO: Here we should call the sparsegpt algorithm with the given mask to fix the other weights before structured pruning
                 pruning_idxs = imp_argsort[:(n_pruned//ch_groups)]
                 if ch_groups > 1:
                     group_size = current_channels//ch_groups
